@@ -1,0 +1,5 @@
+com\hotel\automation\HotelScraperTest.class
+com\hotel\automation\DataAnalyzerTest.class
+com\hotel\automation\HotelPriceRecordTest.class
+com\hotel\automation\ReportGeneratorTest.class
+com\hotel\automation\DatabaseManagerTest.class

@@ -1,0 +1,7 @@
+com\hotel\automation\DataAnalyzer.class
+com\hotel\automation\DatabaseManager.class
+com\hotel\automation\HotelDataAutomationApp.class
+com\hotel\automation\DataAnalyzer$PriceStatistics.class
+com\hotel\automation\HotelPriceRecord.class
+com\hotel\automation\ReportGenerator.class
+com\hotel\automation\HotelScraper.class
