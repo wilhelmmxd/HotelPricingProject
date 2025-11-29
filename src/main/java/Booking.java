@@ -1,562 +1,441 @@
+import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.time.Duration;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
 import org.openqa.selenium.By;
 import org.openqa.selenium.JavascriptExecutor;
 import org.openqa.selenium.WebDriver;
 import org.openqa.selenium.WebElement;
-import org.openqa.selenium.chrome.ChromeDriver;
-import org.openqa.selenium.chrome.ChromeOptions;
-import org.openqa.selenium.support.ui.ExpectedConditions;
 import org.openqa.selenium.support.ui.WebDriverWait;
 
-import java.time.Duration;
-import java.time.LocalDate;
-import java.util.List;
-import java.util.NoSuchElementException;
-import java.util.Set;
+import com.example.hotelpricingproject.selenium.PageInteractionHelper;
+import com.example.hotelpricingproject.selenium.WebDriverFactory;
 
 public class Booking {
 
+    private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+    private static final String BOOKING_BASE_URL = "https://www.booking.com/searchresults.html";
+
     public static void main(String[] args) {
+        // Configuration: Ritz-Carlton in 5 cities over date range Nov 15 - May 1
+        String hotelName = "Ritz-Carlton";
+        List<String> cities = List.of("Dallas", "New York City", "Miami", "Dubai", "Los Angeles");
+        LocalDate startDate = LocalDate.of(2025, 11, 26);
+        LocalDate endDate = LocalDate.of(2026, 5, 1);
+
+        // Ensure SQLite schema exists and show DB path
+        initDatabase();
+        if (!validateSchemaOrExit()) {
+            System.out.println("❌ Schema invalid: id must be INTEGER PRIMARY KEY AUTOINCREMENT. Run: python .\\migrate_db.py");
+            return;
+        }
+        System.out.println("Using SQLite at: " + new java.io.File("hotel_pricing.db").getAbsolutePath());
+
+        System.out.println("╔════════════════════════════════════════════════════════════╗");
+        System.out.println("║       HOTEL PRICE SCRAPER - MULTI-CITY ANALYSIS            ║");
+        System.out.println("╚════════════════════════════════════════════════════════════╝");
+        System.out.println("\nHotel: " + hotelName);
+        System.out.println("Cities: " + String.join(", ", cities));
+        System.out.println("Date Range: " + startDate + " to " + endDate);
+        System.out.println("Days to analyze: " + java.time.temporal.ChronoUnit.DAYS.between(startDate, endDate));
+        System.out.println("\n");
+
+        Map<String, List<HotelPriceData>> allResults = new LinkedHashMap<>();
+
+        for (String city : cities) {
+            System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            System.out.println("📍 Scraping: " + hotelName + " in " + city);
+            System.out.println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+            List<HotelPriceData> cityResults = scrapeCityPrices(hotelName, city, startDate, endDate);
+            allResults.put(city, cityResults);
+
+            if (!cityResults.isEmpty()) {
+                System.out.println("✅ Found " + cityResults.size() + " price records for " + city);
+                // Show lowest 3 prices
+                cityResults.stream()
+                        .sorted(Comparator.comparing(HotelPriceData::getPrice))
+                        .limit(3)
+                        .forEach(p -> System.out.println("   - " + p.getCheckInDate() + ": $" + p.getPrice()));
+            } else {
+                System.out.println("❌ No prices found for " + city);
+            }
+            System.out.println();
+        }
+
+        // Save all results to database
+        System.out.println("\n📊 Saving data to SQLite database...");
+        int totalSaved = 0;
+        for (String city : cities) {
+            List<HotelPriceData> prices = allResults.get(city);
+            for (HotelPriceData data : prices) {
+                if (saveToDatabase(data, hotelName)) {
+                    // Soft verification: confirm row exists; continue on failure
+                    if (!verifyInsert(hotelName, city, data.checkInDate)) {
+                        System.out.println("⚠️  Insert not verified for " + city + " " + data.checkInDate);
+                    }
+                    totalSaved++;
+                }
+            }
+            int insertedToday = countCityInsertsToday(city);
+            System.out.println("ℹ️  Inserted today for " + city + ": " + insertedToday);
+        }
+        System.out.println("✅ Saved " + totalSaved + " records to database\n");
+
+        // Print summary
+        System.out.println("╔════════════════════════════════════════════════════════════╗");
+        System.out.println("║                    ANALYSIS SUMMARY                        ║");
+        System.out.println("╚════════════════════════════════════════════════════════════╝");
+
+        for (String city : cities) {
+            List<HotelPriceData> prices = allResults.get(city);
+            if (!prices.isEmpty()) {
+                BigDecimal minPrice = prices.stream()
+                        .map(HotelPriceData::getPrice)
+                        .min(BigDecimal::compareTo)
+                        .orElse(BigDecimal.ZERO);
+                BigDecimal avgPrice = prices.stream()
+                        .map(HotelPriceData::getPrice)
+                        .reduce(BigDecimal.ZERO, BigDecimal::add)
+                        .divide(new BigDecimal(prices.size()), 2, java.math.RoundingMode.HALF_UP);
+
+                System.out.println(String.format("%-20s | Records: %3d | Min: $%7s | Avg: $%7s", 
+                        city, prices.size(), minPrice, avgPrice));
+            }
+        }
+    }
+
+    /**
+     * Validates schema for AUTOINCREMENT id; returns true if valid.
+     */
+    private static boolean validateSchemaOrExit() {
+        String ddlCheck = "SELECT sql FROM sqlite_master WHERE type='table' AND name='hotel_prices'";
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:hotel_pricing.db");
+             java.sql.Statement stmt = conn.createStatement();
+             java.sql.ResultSet rs = stmt.executeQuery(ddlCheck)) {
+            if (rs.next()) {
+                String sql = rs.getString(1);
+                return sql != null && sql.toUpperCase().contains("INTEGER PRIMARY KEY AUTOINCREMENT");
+            }
+            return false;
+        } catch (SQLException e) {
+            System.out.println("⚠️  Schema validation failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Verifies that a row exists for the given hotel/city/check-in.
+     * Soft check: returns false on error, but caller continues.
+     */
+    private static boolean verifyInsert(String hotelName, String city, LocalDate checkInDate) {
+        String sql = "SELECT COUNT(*) FROM hotel_prices WHERE hotel_name=? AND city=? AND check_in_date=?";
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:hotel_pricing.db");
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, hotelName);
+            ps.setString(2, city);
+            ps.setString(3, checkInDate.toString());
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getInt(1) > 0;
+            }
+        } catch (SQLException e) {
+            System.out.println("⚠️  Verification query failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Counts how many rows were inserted today for a city.
+     */
+    private static int countCityInsertsToday(String city) {
+        String sql = "SELECT COUNT(*) FROM hotel_prices WHERE city=? AND scraped_date=?";
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:hotel_pricing.db");
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, city);
+            ps.setString(2, LocalDate.now().toString());
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        } catch (SQLException e) {
+            System.out.println("⚠️  Count query failed: " + e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Ensure SQLite table exists with AUTOINCREMENT id.
+     */
+    private static void initDatabase() {
+        String ddl = "CREATE TABLE IF NOT EXISTS hotel_prices (" +
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                "hotel_name TEXT NOT NULL, " +
+                "city TEXT NOT NULL, " +
+                "check_in_date TEXT NOT NULL, " +
+                "check_out_date TEXT NOT NULL, " +
+                "price REAL NOT NULL, " +
+                "rating TEXT, " +
+                "address TEXT, " +
+                "scraped_date TEXT NOT NULL" +
+                ")";
+
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:hotel_pricing.db");
+             java.sql.Statement stmt = conn.createStatement()) {
+            stmt.execute("PRAGMA journal_mode=WAL");
+            stmt.executeUpdate(ddl);
+        } catch (SQLException e) {
+            System.out.println("⚠️  Failed to initialize database: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Scrapes hotel prices for a city across a date range
+     */
+    public static boolean saveToDatabase(HotelPriceData data, String hotelName) {
+        String sql = "INSERT INTO hotel_prices (hotel_name, city, check_in_date, check_out_date, price, rating, address, scraped_date) " +
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:hotel_pricing.db");
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            
+            pstmt.setString(1, hotelName);
+            pstmt.setString(2, data.city);
+            // Store dates as ISO-8601 text to avoid epoch integers in SQLite
+            pstmt.setString(3, data.checkInDate.toString());
+            pstmt.setString(4, data.checkOutDate.toString());
+            pstmt.setBigDecimal(5, data.price);
+            pstmt.setString(6, data.rating);
+            pstmt.setString(7, data.address);
+            pstmt.setString(8, LocalDate.now().toString());
+            
+            pstmt.executeUpdate();
+            return true;
+        } catch (SQLException e) {
+            // Auto-create table and retry once if missing
+            if (e.getMessage() != null && e.getMessage().contains("no such table: hotel_prices")) {
+                System.out.println("ℹ️  Table missing. Creating and retrying insert...");
+                initDatabase();
+                try (Connection conn2 = DriverManager.getConnection("jdbc:sqlite:hotel_pricing.db");
+                     PreparedStatement pstmt2 = conn2.prepareStatement(sql)) {
+                    pstmt2.setString(1, hotelName);
+                    pstmt2.setString(2, data.city);
+                    pstmt2.setString(3, data.checkInDate.toString());
+                    pstmt2.setString(4, data.checkOutDate.toString());
+                    pstmt2.setBigDecimal(5, data.price);
+                    pstmt2.setString(6, data.rating);
+                    pstmt2.setString(7, data.address);
+                    pstmt2.setString(8, LocalDate.now().toString());
+                    pstmt2.executeUpdate();
+                    return true;
+                } catch (SQLException ex2) {
+                    System.out.println("⚠️  Failed to save after init: " + ex2.getMessage());
+                    return false;
+                }
+            } else {
+                System.out.println("⚠️  Failed to save: " + e.getMessage());
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Scrapes hotel prices for a city across a date range
+     */
+    public static List<HotelPriceData> scrapeCityPrices(String hotelName, String city, 
+                                                        LocalDate startDate, LocalDate endDate) {
+        List<HotelPriceData> results = new ArrayList<>();
         WebDriver driver = null;
 
         try {
-            ChromeOptions options = new ChromeOptions();
-            options.addArguments("--start-maximized");
-            options.addArguments("--disable-blink-features=AutomationControlled");
-            options.addArguments("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-            options.setExperimentalOption("excludeSwitches", new String[]{"enable-automation"});
-            options.setExperimentalOption("useAutomationExtension", false);
-
-            driver = new ChromeDriver(options);
+            driver = createWebDriver();
             WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
             JavascriptExecutor js = (JavascriptExecutor) driver;
 
-            js.executeScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
+            // Scrape every 3 days in the date range
+            LocalDate currentDate = startDate;
 
-            // Specific hotel search
-            //String hotelName = "Four Seasons Hotel Atlanta";
-            //String hotelName = "The Westin Peachtree Plaza, Atlanta";
-            String hotelName = "The Ritz-Carlton Atlanta";
+            while (!currentDate.isAfter(endDate)) {
+                LocalDate checkOut = currentDate.plusDays(1);
 
-            // Date parameters (check-in tomorrow, check-out day after)
-            LocalDate checkIn = LocalDate.now().plusDays(1);
-            LocalDate checkOut = checkIn.plusDays(1);
+                try {
+                    String url = buildBookingUrl(hotelName, city, currentDate, checkOut);
+                    System.out.print("  Scraping " + currentDate + "... ");
 
-            // Build URL to search specifically for hotel name
-            String url = buildBookingUrl(hotelName, checkIn, checkOut);
+                    driver.get(url);
+                    Thread.sleep(3000);
 
-            System.out.println("Searching for: " + hotelName);
-            System.out.println("Navigating to: " + url);
-            System.out.println();
+                    PageInteractionHelper.handleCookies(driver, wait);
+                    PageInteractionHelper.handlePopups(driver);
+                    PageInteractionHelper.scrollPage(driver, js);
 
-            driver.get(url);
-            Thread.sleep(5000);
+                    WebElement hotelCard = findHotelInResults(driver, hotelName);
 
-            // Handle cookie consent banner
-            handleCookieBanner(driver, wait);
+                    if (hotelCard != null) {
+                        HotelPriceData priceData = extractPriceData(hotelCard, hotelName, city, currentDate, checkOut);
+                        if (priceData != null) {
+                            results.add(priceData);
+                            System.out.println("✓ $" + priceData.getPrice());
+                        } else {
+                            System.out.println("⚠ Found but price extraction failed");
+                        }
+                    } else {
+                        System.out.println("✗ Hotel not found");
+                    }
 
-            // Close any popups
-            closePopups(driver);
+                } catch (Exception e) {
+                    System.out.println("✗ Error: " + e.getMessage());
+                }
 
-            System.out.println("Page loaded. Analyzing results...\n");
-
-            // Scroll to load all results
-            scrollToLoadResults(driver, js);
-
-            // Search for the specific hotel in results
-            System.out.println("=== Searching for Hotel  ===\n");
-            WebElement hotelCard = findHotel(driver, hotelName);
-
-            if (hotelCard != null) {
-                System.out.println("✓ FOUND: Hotel");
-                System.out.println("=" .repeat(60));
-                extractDetailedHotelInfo(hotelCard, driver);
-                System.out.println("=" .repeat(60));
-
-                // Try to click into hotel detail page
-                System.out.println("\n=== Attempting to open hotel detail page ===\n");
-                clickIntoHotelDetail(driver, wait, js, hotelCard);
-            } else {
-                System.out.println("✗ Hotel not found in results");
-                System.out.println("Possible reasons:");
-                System.out.println("  - Hotel not available on Booking.com");
-                System.out.println("  - No availability for selected dates");
-                System.out.println("  - Different hotel name on Booking.com");
-
-                // Show what hotels were found
-                showAvailableHotels(driver);
+                // Move to next date (every 3 days)
+                currentDate = currentDate.plusDays(3);
             }
 
-            // Keep browser open for inspection
-            System.out.println("\n\nBrowser will stay open. Press Enter to close...");
-            System.in.read();
-
-        } catch (Exception e) {
-            e.printStackTrace();
         } finally {
             if (driver != null) {
                 driver.quit();
             }
         }
+
+        return results;
     }
 
-
-    public static int getPriceOfRoom(String hotelName, LocalDate start) {
-        WebDriver driver = null;
-
-        try {
-            ChromeOptions options = new ChromeOptions();
-            options.addArguments("--start-maximized");
-            options.addArguments("--headless");
-            options.addArguments("--disable-blink-features=AutomationControlled");
-            options.addArguments("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-            options.setExperimentalOption("excludeSwitches", new String[]{"enable-automation"});
-            options.setExperimentalOption("useAutomationExtension", false);
-
-            driver = new ChromeDriver(options);
-            WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
-            JavascriptExecutor js = (JavascriptExecutor) driver;
-
-            js.executeScript("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})");
-
-            // Date parameters (check-in tomorrow, check-out day after)
-            LocalDate checkIn = start.plusDays(1);
-            LocalDate checkOut = checkIn.plusDays(1);
-
-            // Build URL to search specifically for the hotel name
-            String url = buildBookingUrl(hotelName, checkIn, checkOut);
-
-            System.out.println("Searching for: " + hotelName);
-            System.out.println("Navigating to: " + url);
-            System.out.println();
-
-            driver.get(url);
-            Thread.sleep(5000);
-
-            // Handle cookie consent banner
-            handleCookieBanner(driver, wait);
-
-            // Close any popups
-            closePopups(driver);
-
-            System.out.println("Page loaded. Analyzing results...\n");
-
-            // Scroll to load all results
-            scrollToLoadResults(driver, js);
-
-            // Search for the specific hotel in results
-            System.out.println("=== Searching for" + hotelName +" ===\n");
-            WebElement hotelCard = findHotel(driver, hotelName);
-
-            if (hotelCard != null) {
-                System.out.println("✓ FOUND: " + hotelName);
-                System.out.println("=".repeat(60));
-                extractDetailedHotelInfo(hotelCard, driver);
-                System.out.println("=".repeat(60));
-
-                // Try to click into hotel detail page
-                System.out.println("\n=== Attempting to open hotel detail page ===\n");
-                clickIntoHotelDetail(driver, wait, js, hotelCard);
-            } else {
-                System.out.println("✗ " + hotelName +" not found in results");
-                System.out.println("Possible reasons:");
-                System.out.println("  - Hotel not available on Booking.com");
-                System.out.println("  - No availability for selected dates");
-                System.out.println("  - Different hotel name on Booking.com");
-
-                // Show what hotels were found
-                showAvailableHotels(driver);
-            }
-
-            // Keep browser open for inspection
-            System.out.println("\n\nBrowser will stay open. Press Enter to close...");
-            System.in.read();
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            if (driver != null) {
-                driver.quit();
-            }
-        }
-        return 0;
-    }
-
-    private static String buildBookingUrl(String hotelName, LocalDate checkIn, LocalDate checkOut) {
-        // Search specifically for the hotel name
+    private static String buildBookingUrl(String hotelName, String city, LocalDate checkIn, LocalDate checkOut) {
+        String searchTerm = (hotelName + " " + city).replace(" ", "+");
         return String.format(
-                "https://www.booking.com/searchresults.html?ss=%s&checkin=%s&checkout=%s&group_adults=2&no_rooms=1",
-                hotelName.replace(" ", "+"),
-                checkIn.toString(),
-                checkOut.toString()
+                "%s?ss=%s&checkin=%s&checkout=%s&group_adults=2&no_rooms=1",
+                BOOKING_BASE_URL,
+                searchTerm,
+                checkIn.format(DATE_FORMATTER),
+                checkOut.format(DATE_FORMATTER)
         );
     }
 
-    private static void handleCookieBanner(WebDriver driver, WebDriverWait wait) {
-        try {
-            String[] cookieSelectors = {
-                    "button[id*='onetrust-accept']",
-                    "button[aria-label*='Accept']",
-                    "#onetrust-accept-btn-handler",
-                    "button:contains('Accept')"
-            };
-
-            for (String selector : cookieSelectors) {
-                try {
-                    WebElement acceptButton = driver.findElement(By.cssSelector(selector));
-                    if (acceptButton.isDisplayed()) {
-                        acceptButton.click();
-                        System.out.println("✓ Accepted cookies\n");
-                        Thread.sleep(1000);
-                        return;
-                    }
-                } catch (Exception e) {
-                    continue;
-                }
-            }
-        } catch (Exception e) {
-            // No cookie banner or already accepted
-        }
+    private static WebDriver createWebDriver() {
+        return WebDriverFactory.createDefault();
     }
 
-    private static void closePopups(WebDriver driver) {
-        try {
-            String[] closeSelectors = {
-                    "button[aria-label*='Dismiss']",
-                    "button[aria-label*='Close']",
-                    ".bui-modal__close",
-                    "[data-testid='header-sign-in-button-close']",
-                    "button[data-testid='genius-onboarding-close-button']"
-            };
+    // Page interaction methods moved to PageInteractionHelper utility class
 
-            for (String selector : closeSelectors) {
+    private static WebElement findHotelInResults(WebDriver driver, String hotelName) {
+        try {
+            List<WebElement> cards = driver.findElements(By.cssSelector("[data-testid='property-card']"));
+
+            for (WebElement card : cards) {
                 try {
-                    List<WebElement> closeButtons = driver.findElements(By.cssSelector(selector));
-                    for (WebElement btn : closeButtons) {
-                        if (btn.isDisplayed()) {
-                            btn.click();
-                            Thread.sleep(500);
-                        }
-                    }
-                } catch (Exception e) {
-                    continue;
-                }
-            }
-        } catch (Exception e) {
-            // Ignore
-        }
-    }
-
-    private static void scrollToLoadResults(WebDriver driver, JavascriptExecutor js) {
-        try {
-            for (int i = 0; i < 3; i++) {
-                js.executeScript("window.scrollBy(0, 800)");
-                Thread.sleep(1500);
-            }
-            js.executeScript("window.scrollTo(0, 0)");
-            Thread.sleep(1000);
-        } catch (Exception e) {
-            // Ignore
-        }
-    }
-
-    private static WebElement findHotel(WebDriver driver, String hotelName) {
-        try {
-            WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(10));
-            wait.until(ExpectedConditions.presenceOfAllElementsLocatedBy(
-                    By.cssSelector("[data-testid='property-card']")
-            ));
-
-            List<WebElement> propertyCards = driver.findElements(By.cssSelector("[data-testid='property-card']"));
-            System.out.println("Scanning " + propertyCards.size() + " properties...\n");
-
-            for (WebElement card : propertyCards) {
-                try {
-                    // Locate the hotel title inside each card
                     WebElement titleElement = card.findElement(By.cssSelector("[data-testid='title']"));
                     String title = titleElement.getText().toLowerCase();
 
                     if (title.contains(hotelName.toLowerCase())) {
-                        System.out.println("✅ Found hotel: " + title);
                         return card;
                     }
-
-                } catch (NoSuchElementException ignored) {
-                    // Skip cards that don't have title
+                } catch (Exception e) {
+                    // Continue searching
                 }
             }
-
-            System.out.println("No hotel found matching: " + hotelName);
-            return null;
-
         } catch (Exception e) {
-            System.out.println("Error finding hotel: " + e.getMessage());
-            return null;
+            // No results
         }
+        return null;
     }
 
-
-    private static void extractDetailedHotelInfo(WebElement propertyCard, WebDriver driver) {
+    private static HotelPriceData extractPriceData(WebElement card, String hotelName, String city, 
+                                                   LocalDate checkIn, LocalDate checkOut) {
         try {
-            // Extract hotel name
-            System.out.println("HOTEL INFORMATION:");
-            System.out.println("-" .repeat(60));
+            String title = card.findElement(By.cssSelector("[data-testid='title']")).getText();
+            String rating = null;
+            String price = null;
 
+            // Extract rating
             try {
-                WebElement nameElement = propertyCard.findElement(
-                        By.cssSelector("[data-testid='title']")
-                );
-                System.out.println("Name: " + nameElement.getText());
+                rating = card.findElement(By.cssSelector("[data-testid='review-score']")).getText();
             } catch (Exception e) {
-                try {
-                    WebElement nameElement = propertyCard.findElement(By.cssSelector("h3, [class*='title']"));
-                    System.out.println("Name: " + nameElement.getText());
-                } catch (Exception ex) {
-                    System.out.println("Name: Could not extract");
-                }
+                rating = "N/A";
             }
 
             // Extract price
             try {
-                WebElement priceElement = propertyCard.findElement(
-                        By.cssSelector("[data-testid='price-and-discounted-price']")
-                );
-                System.out.println("Price: " + priceElement.getText());
+                WebElement priceElem = card.findElement(By.cssSelector("[data-testid='price-and-discounted-price']"));
+                price = priceElem.getText();
             } catch (Exception e) {
                 try {
-                    List<WebElement> priceElements = propertyCard.findElements(
-                            By.cssSelector("[class*='price'], [aria-label*='price']")
-                    );
-
-                    for (WebElement priceElem : priceElements) {
-                        String priceText = priceElem.getText();
-                        if (!priceText.isEmpty() && (priceText.contains("$") || priceText.contains("US$") || priceText.matches(".*\\d+.*"))) {
-                            System.out.println("Price: " + priceText);
+                    List<WebElement> elements = card.findElements(By.cssSelector("span, div"));
+                    for (WebElement elem : elements) {
+                        String text = elem.getText();
+                        if (text.matches(".*\\$\\s?\\d+.*")) {
+                            price = text;
                             break;
                         }
                     }
                 } catch (Exception ex) {
-                    System.out.println("Price: Could not extract");
+                    // No price found
                 }
             }
 
-            // Extract rating/review score
-            try {
-                WebElement ratingElement = propertyCard.findElement(
-                        By.cssSelector("[data-testid='review-score']")
-                );
-                System.out.println("Rating: " + ratingElement.getText());
-            } catch (Exception e) {
-                try {
-                    WebElement ratingElement = propertyCard.findElement(
-                            By.cssSelector("[aria-label*='Scored'], [class*='review-score']")
-                    );
-                    System.out.println("Rating: " + ratingElement.getText());
-                } catch (Exception ex) {
-                    System.out.println("Rating: Not available");
+            if (price != null && !price.isEmpty()) {
+                BigDecimal priceValue = extractPriceValue(price);
+                if (priceValue != null && priceValue.compareTo(BigDecimal.ZERO) > 0) {
+                    return new HotelPriceData(hotelName, city, checkIn, checkOut, priceValue, rating, title);
                 }
             }
-
-            // Extract location/distance
-            try {
-                WebElement locationElement = propertyCard.findElement(
-                        By.cssSelector("[data-testid='distance']")
-                );
-                System.out.println("Distance: " + locationElement.getText());
-            } catch (Exception e) {
-                // Not critical
-            }
-
-            // Extract address
-            try {
-                WebElement addressElement = propertyCard.findElement(
-                        By.cssSelector("[data-testid='address']")
-                );
-                System.out.println("Address: " + addressElement.getText());
-            } catch (Exception e) {
-                // Not critical
-            }
-
-            System.out.println("-" .repeat(60));
-            System.out.println("\nFULL CARD TEXT:");
-            System.out.println(propertyCard.getText());
 
         } catch (Exception e) {
-            System.out.println("Error extracting hotel info: " + e.getMessage());
+            // Failed to extract
         }
+
+        return null;
     }
 
-    private static void clickIntoHotelDetail(WebDriver driver, WebDriverWait wait, JavascriptExecutor js, WebElement hotelCard) {
+    private static BigDecimal extractPriceValue(String priceText) {
         try {
-            // Find the clickable link/title
-            WebElement clickableElement = null;
-
-            try {
-                clickableElement = hotelCard.findElement(By.cssSelector("[data-testid='title']"));
-            } catch (Exception e) {
-                try {
-                    clickableElement = hotelCard.findElement(By.cssSelector("a[data-testid='title-link']"));
-                } catch (Exception ex) {
-                    try {
-                        clickableElement = hotelCard.findElement(By.cssSelector("a"));
-                    } catch (Exception exc) {
-                        System.out.println("Could not find clickable element");
-                        return;
-                    }
-                }
+            String cleaned = priceText.replaceAll("[^0-9.]", "");
+            if (!cleaned.isEmpty()) {
+                return new BigDecimal(cleaned);
             }
-
-            // Store original window
-            String originalWindow = driver.getWindowHandle();
-
-            // Scroll to element and click
-            js.executeScript("arguments[0].scrollIntoView({block: 'center'});", clickableElement);
-            Thread.sleep(1000);
-
-            System.out.println("Clicking into hotel detail page...");
-
-            try {
-                clickableElement.click();
-            } catch (Exception e) {
-                js.executeScript("arguments[0].click();", clickableElement);
-            }
-
-            Thread.sleep(3000);
-
-            // Check if new window/tab opened
-            Set<String> windowHandles = driver.getWindowHandles();
-            if (windowHandles.size() > 1) {
-                for (String handle : windowHandles) {
-                    if (!handle.equals(originalWindow)) {
-                        driver.switchTo().window(handle);
-                        break;
-                    }
-                }
-            }
-
-            System.out.println("✓ Opened hotel detail page: " + driver.getTitle());
-            Thread.sleep(2000);
-
-            // Extract information from detail page
-            extractFromDetailPage(driver, js);
-
         } catch (Exception e) {
-            System.out.println("Error clicking into hotel detail: " + e.getMessage());
+            // Parse error
         }
+        return null;
     }
 
-    private static void extractFromDetailPage(WebDriver driver, JavascriptExecutor js) {
-        try {
-            System.out.println("\n" + "=" .repeat(60));
-            System.out.println("DETAIL PAGE INFORMATION:");
-            System.out.println("=" .repeat(60));
+    // Simple data class
+    static class HotelPriceData {
+        public final String hotelName;
+        public final String city;
+        public final LocalDate checkInDate;
+        public final LocalDate checkOutDate;
+        public final BigDecimal price;
+        public final String rating;
+        public final String address;
 
-            // Scroll to load price section
-            js.executeScript("window.scrollBy(0, 300)");
-            Thread.sleep(2000);
+        HotelPriceData(String hotelName, String city, LocalDate checkIn, LocalDate checkOut, 
+                      BigDecimal price, String rating, String address) {
+            this.hotelName = hotelName;
+            this.city = city;
+            this.checkInDate = checkIn;
+            this.checkOutDate = checkOut;
+            this.price = price;
+            this.rating = rating;
+            this.address = address;
+        }
 
-            // Extract hotel name from detail page
-            try {
-                WebElement nameElement = driver.findElement(By.cssSelector("h2[class*='pp-header__title']"));
-                System.out.println("Hotel Name: " + nameElement.getText());
-            } catch (Exception e) {
-                System.out.println("Hotel Name: Could not extract from detail page");
-            }
+        public LocalDate getCheckInDate() { return checkInDate; }
+        public BigDecimal getPrice() { return price; }
+        public String getRating() { return rating; }
+        public String getAddress() { return address; }
 
-            // Extract prices from detail page
-            System.out.println("\nPRICES:");
-            String[] priceSelectors = {
-                    "[data-testid='price-and-discounted-price']",
-                    "[class*='prco-text-nowrap-helper']",
-                    "[class*='prco-valign-middle-helper']",
-                    "span[aria-label*='price']",
-                    "[class*='bui-price-display__value']"
-            };
-
-            for (String selector : priceSelectors) {
-                try {
-                    List<WebElement> elements = driver.findElements(By.cssSelector(selector));
-                    for (WebElement elem : elements) {
-                        String text = elem.getText();
-                        if (!text.isEmpty() && (text.contains("$") || text.contains("US$") || text.matches(".*\\d+.*"))) {
-                            System.out.println("  - " + text);
-                        }
-                    }
-                } catch (Exception e) {
-                    continue;
-                }
-            }
-
-            // Extract amenities
-            System.out.println("\nAMENITIES:");
-            try {
-                List<WebElement> amenities = driver.findElements(
-                        By.cssSelector("[class*='facility'], [class*='important_facility']")
-                );
-                int count = 0;
-                for (WebElement amenity : amenities) {
-                    String text = amenity.getText();
-                    if (!text.isEmpty() && count < 10) {
-                        System.out.println("  - " + text);
-                        count++;
-                    }
-                }
-            } catch (Exception e) {
-                System.out.println("  Could not extract amenities");
-            }
-
-            // JavaScript extraction for all prices
-            System.out.println("\nALL PRICES FOUND ON PAGE:");
-            String script =
-                    "var prices = new Set();" +
-                            "var regex = /\\$\\s?\\d+(?:,\\d{3})*(?:\\.\\d{2})?|US\\$\\s?\\d+(?:,\\d{3})*(?:\\.\\d{2})?/g;" +
-                            "var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);" +
-                            "while(walker.nextNode()) {" +
-                            "    var matches = walker.currentNode.textContent.match(regex);" +
-                            "    if (matches) {" +
-                            "        matches.forEach(function(m) { prices.add(m); });" +
-                            "    }" +
-                            "}" +
-                            "return Array.from(prices);";
-
-            Object result = js.executeScript(script);
-            if (result instanceof List) {
-                List<String> prices = (List<String>) result;
-                for (String price : prices) {
-                    System.out.println("  - " + price);
-                }
-            }
-
-        } catch (Exception e) {
-            System.out.println("Error extracting from detail page: " + e.getMessage());
+        @Override
+        public String toString() {
+            return String.format("%s | %s-%s | $%s | Rating: %s | %s",
+                    city, checkInDate, checkOutDate, price, rating, address);
         }
     }
-
-    private static void showAvailableHotels(WebDriver driver) {
-        try {
-            System.out.println("\n=== Hotels found in search results ===\n");
-
-            List<WebElement> propertyCards = driver.findElements(
-                    By.cssSelector("[data-testid='property-card']")
-            );
-
-            int count = 1;
-            for (WebElement card : propertyCards) {
-                try {
-                    WebElement nameElement = card.findElement(By.cssSelector("[data-testid='title']"));
-                    String name = nameElement.getText();
-                    if (!name.isEmpty()) {
-                        System.out.println(count + ". " + name);
-                        count++;
-                        if (count > 10) break; // Show first 10
-                    }
-                } catch (Exception e) {
-                    continue;
-                }
-            }
-
-        } catch (Exception e) {
-            System.out.println("Could not list available hotels");
-        }
-    }
-
 }

@@ -31,3 +31,17 @@ build/
 
 ### VS Code ###
 .vscode/
+
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS/system
+.DS_Store
+Thumbs.db
+
+# Keep DB tracked intentionally (do NOT ignore)
+# hotel_pricing.db
